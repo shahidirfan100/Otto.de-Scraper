@@ -8,10 +8,12 @@ const DEFAULT_SEARCH_QUERY = 'shirt';
 const DEFAULT_RESULTS_WANTED = 100;
 const DEFAULT_MAX_PAGES = 20;
 const INTERNAL_OFFSET_STEP = 24;
-const INTERNAL_MAX_CONCURRENCY = 16;
-const INTERNAL_MIN_DELAY_MS = 140;
-const INTERNAL_MAX_DELAY_MS = 420;
-const PREFETCH_WINDOW_PAGES = 8;
+const INTERNAL_MAX_CONCURRENCY = 12;
+const INTERNAL_MIN_DELAY_MS = 220;
+const INTERNAL_MAX_DELAY_MS = 650;
+const PREFETCH_WINDOW_PAGES = 6;
+const PUSH_BATCH_SIZE = 25;
+const PROGRESS_LOG_STEP = 25;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -308,25 +310,61 @@ try {
     const seenProducts = new Set();
     const seenOffsets = new Set();
     let saved = 0;
+    let lastProgressLogged = 0;
     let pushQueue = Promise.resolve();
 
-    const pushItemIfNeeded = async (item) => {
-        let pushed = false;
+    const pushItemsIfNeeded = async (candidateItems) => {
+        let result = {
+            pushed: 0,
+            rich: 0,
+            basic: 0,
+            total: saved,
+        };
+
         pushQueue = pushQueue.then(async () => {
-            if (saved >= resultsWanted) return;
-            await Actor.pushData(item);
-            saved += 1;
-            pushed = true;
+            const acceptedItems = [];
+            let rich = 0;
+            let basic = 0;
+
+            for (const item of candidateItems) {
+                if (saved + acceptedItems.length >= resultsWanted) break;
+                if (!item?.product_url) continue;
+
+                const dedupeKey = item.product_url.replace(/\?.*$/, '');
+                if (seenProducts.has(dedupeKey)) continue;
+
+                seenProducts.add(dedupeKey);
+                acceptedItems.push(item);
+
+                if (item.data_quality === 'rich') rich += 1;
+                else basic += 1;
+            }
+
+            for (let i = 0; i < acceptedItems.length; i += PUSH_BATCH_SIZE) {
+                await Actor.pushData(acceptedItems.slice(i, i + PUSH_BATCH_SIZE));
+            }
+
+            saved += acceptedItems.length;
+            result = {
+                pushed: acceptedItems.length,
+                rich,
+                basic,
+                total: saved,
+            };
         });
+
         await pushQueue;
-        return pushed;
+        return result;
     };
 
     const crawler = new CheerioCrawler({
         proxyConfiguration,
-        maxRequestRetries: 5,
+        maxRequestRetries: 2,
         requestHandlerTimeoutSecs: 90,
         maxConcurrency,
+        statisticsOptions: {
+            logIntervalSecs: 3600,
+        },
         useSessionPool: true,
         sessionPoolOptions: {
             maxPoolSize: 80,
@@ -344,7 +382,7 @@ try {
                     'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
                     referer: request.url,
                 };
-                gotOptions.timeout = { request: 45000 };
+                gotOptions.timeout = { request: 35000 };
                 gotOptions.retry = { limit: 0 };
 
                 const jitter = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1));
@@ -354,11 +392,11 @@ try {
         errorHandler: async ({ request }, error) => {
             const retryCount = request.retryCount ?? 0;
             const backoffMs = Math.min(15000, 600 * (2 ** retryCount)) + Math.floor(Math.random() * 400);
-            log.warning(`Retrying ${request.url} after error: ${error.message}. Waiting ${backoffMs} ms.`);
+            log.debug(`Retrying failed request with backoff (${backoffMs} ms). Error: ${error.message}`);
             await sleep(backoffMs);
         },
         failedRequestHandler: async ({ request, error }) => {
-            log.softFail(`Request failed after retries: ${request.url} (${error.message})`);
+            log.softFail(`Request failed after retries: requestId=${request.id} (${error.message})`);
         },
         async requestHandler({ request, response, body, $, addRequests }) {
             if (saved >= resultsWanted) return;
@@ -392,39 +430,25 @@ try {
             const basicItems = extracted.filter((item) => item.data_quality !== 'rich');
             const orderedItems = collectDetails ? richItems : extracted;
 
-            for (const item of orderedItems) {
-                if (saved >= resultsWanted) break;
-                if (!item.product_url) continue;
-
-                const dedupeKey = item.product_url.replace(/\?.*$/, '');
-                if (seenProducts.has(dedupeKey)) continue;
-
-                seenProducts.add(dedupeKey);
-                const pushed = await pushItemIfNeeded(item);
-                if (!pushed) break;
-
-                if (item.data_quality === 'rich') pushedRich += 1;
-                else pushedBasic += 1;
-            }
+            const primaryPush = await pushItemsIfNeeded(orderedItems);
+            pushedRich += primaryPush.rich;
+            pushedBasic += primaryPush.basic;
 
             if (collectDetails && pageNo >= maxPages && saved < resultsWanted) {
-                for (const item of basicItems) {
-                    if (saved >= resultsWanted) break;
-                    if (!item.product_url) continue;
-
-                    const dedupeKey = item.product_url.replace(/\?.*$/, '');
-                    if (seenProducts.has(dedupeKey)) continue;
-
-                    seenProducts.add(dedupeKey);
-                    const pushed = await pushItemIfNeeded(item);
-                    if (!pushed) break;
-                    pushedBasic += 1;
-                }
+                const fallbackPush = await pushItemsIfNeeded(basicItems);
+                pushedRich += fallbackPush.rich;
+                pushedBasic += fallbackPush.basic;
             }
 
-            log.info(
-                `LIST page ${pageNo} ${request.url} -> extracted ${extracted.length}, pushed rich ${pushedRich}, basic ${pushedBasic}, total ${saved}/${resultsWanted}`,
-            );
+            const pushedThisTurn = pushedRich + pushedBasic;
+            const shouldLogProgress = saved >= resultsWanted
+                || (saved - lastProgressLogged >= PROGRESS_LOG_STEP)
+                || (pushedThisTurn > 0 && pageNo === 1);
+
+            if (shouldLogProgress && pushedThisTurn > 0 && saved > lastProgressLogged) {
+                log.info(`Pushed ${saved}/${resultsWanted} items (latest batch: ${pushedThisTurn}, rich: ${pushedRich}, basic: ${pushedBasic})`);
+                lastProgressLogged = saved;
+            }
 
             if (saved >= resultsWanted || pageNo >= maxPages) return;
 
@@ -475,7 +499,7 @@ try {
     seenOffsets.add(initialOffsetKey);
 
     log.info(
-        `Starting crawl: startUrl=${normalizedStartUrl}, results_wanted=${resultsWanted}, max_pages=${maxPages}, collectDetails=${Boolean(collectDetails)}, internalConcurrency=${maxConcurrency}`,
+        `Starting crawl: results_wanted=${resultsWanted}, max_pages=${maxPages}, collectDetails=${Boolean(collectDetails)}, internalConcurrency=${maxConcurrency}`,
     );
 
     await crawler.run([{
