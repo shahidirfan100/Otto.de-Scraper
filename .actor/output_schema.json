@@ -1,0 +1,16 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "Otto.de Products Output",
+    "properties": {
+        "dataset": {
+            "type": "string",
+            "title": "Dataset",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        },
+        "overview": {
+            "type": "string",
+            "title": "Overview",
+            "template": "{{links.apiDefaultDatasetUrl}}/items?view=overview"
+        }
+    }
+}

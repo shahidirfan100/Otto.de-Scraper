@@ -1,0 +1,59 @@
+{
+  "title": "Otto.de Product Scraper",
+  "description": "Scrape products from Otto.de using JSON-first extraction from search/category pages. The actor paginates by offset, de-duplicates items, and falls back to HTML extraction when needed.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start from a specific Otto.de search/category URL. If empty, the actor builds a search URL from Search Query.",
+      "editor": "textfield",
+      "default": "",
+      "prefill": "https://www.otto.de/suche/shirt/?o=0&l=gp&c="
+    },
+    "searchQuery": {
+      "title": "Search Query (if not using Start URL)",
+      "type": "string",
+      "description": "Search term used when Start URL is empty.",
+      "editor": "textfield",
+      "default": "shirt",
+      "prefill": "shirt"
+    },
+    "collectDetails": {
+      "title": "Prefer rich records",
+      "type": "boolean",
+      "description": "If enabled, the actor prioritizes rich product records (with pricing/rating) and only falls back to basic records when needed.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum number of products",
+      "type": "integer",
+      "description": "The maximum number of products to collect. Leave empty to collect all available products.",
+      "minimum": 1,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "Safety cap on the number of paginated listing pages to visit.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 20
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy for better results.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": false,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

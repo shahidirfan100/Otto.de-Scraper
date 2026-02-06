@@ -1,0 +1,126 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": ["string", "null"]
+      },
+      "brand": {
+        "type": ["string", "null"]
+      },
+      "price": {
+        "type": ["string", "null"]
+      },
+      "original_price": {
+        "type": ["string", "null"]
+      },
+      "rating": {
+        "type": ["number", "null"]
+      },
+      "review_count": {
+        "type": ["integer", "null"]
+      },
+      "availability": {
+        "type": ["string", "null"]
+      },
+      "image_url": {
+        "type": ["string", "null"]
+      },
+      "product_url": {
+        "type": ["string", "null"]
+      },
+      "article_number": {
+        "type": ["string", "null"]
+      },
+      "variation_id": {
+        "type": ["string", "null"]
+      },
+      "data_quality": {
+        "type": ["string", "null"]
+      },
+      "source": {
+        "type": ["string", "null"]
+      }
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "name",
+          "brand",
+          "price",
+          "original_price",
+          "rating",
+          "review_count",
+          "availability",
+          "image_url",
+          "product_url",
+          "article_number",
+          "variation_id",
+          "data_quality",
+          "source"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Product Name",
+            "format": "text"
+          },
+          "brand": {
+            "label": "Brand",
+            "format": "text"
+          },
+          "price": {
+            "label": "Price",
+            "format": "text"
+          },
+          "original_price": {
+            "label": "Original Price",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "review_count": {
+            "label": "Reviews",
+            "format": "number"
+          },
+          "availability": {
+            "label": "Availability",
+            "format": "text"
+          },
+          "image_url": {
+            "label": "Image",
+            "format": "image"
+          },
+          "product_url": {
+            "label": "URL",
+            "format": "link"
+          },
+          "article_number": {
+            "label": "Article Number",
+            "format": "text"
+          },
+          "variation_id": {
+            "label": "Variation ID",
+            "format": "text"
+          },
+          "data_quality": {
+            "label": "Data Quality",
+            "format": "text"
+          },
+          "source": {
+            "label": "Source",
+            "format": "text"
+          }
+        }
+      }
+    }
+  }
+}
