@@ -49,8 +49,7 @@
       "description": "Use Apify Proxy for better results.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": false,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "useApifyProxy": false
       }
     }
   },
