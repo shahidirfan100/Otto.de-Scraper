@@ -7,7 +7,8 @@ Extract product data from Otto.de quickly and reliably for research, monitoring,
 - **Fast Production Runs** — Optimized internal crawl settings for high-throughput data collection.
 - **Reliable Product Coverage** — Automatically navigates Otto.de listing pages to gather broad result sets.
 - **Rich Product Records** — Collects pricing, brand, rating, review count, availability, and product metadata.
-- **Duplicate Protection** — Avoids duplicate product records during larger runs.
+- **Duplicate Protection** — Removes repeated products across paginated result sets.
+- **Clean Data Quality** — Excludes null and empty values from output records.
 - **Flexible Start Options** — Start from a specific Otto.de page or from a search query.
 - **Clean Dataset Output** — Delivers normalized data ready for BI tools and automation workflows.
 
@@ -59,10 +60,27 @@ Each dataset item contains:
 | `image_url` | String | Product image URL. |
 | `product_url` | String | Product detail page URL. |
 | `url` | String | Canonical source URL for the record. |
+| `product_id` | String | Internal product identifier. |
+| `product_type` | String | Product classification (for example organic or sponsored). |
 | `article_number` | String | Product/article identifier when available. |
 | `variation_id` | String | Variation identifier when available. |
+| `advertiser_legal_name` | String | Advertiser legal entity for promoted products when available. |
+| `funder_legal_name` | String | Funder legal entity for promoted products when available. |
+| `local_list_position` | Number | Product position inside the rendered product grid. |
+| `actual_list_position` | Number | Absolute position of the item in the result stream. |
+| `origin_position` | Number | Original ranking position before layout transforms. |
+| `list_type` | String | Listing item type indicator from Otto results. |
+| `page_no` | Number | Page index processed in the run loop. |
+| `page_offset` | Number | Offset used when loading this record batch. |
 | `data_quality` | String | Record completeness marker (`rich` or `basic`). |
 | `source` | String | Origin marker for the extracted record. |
+| `colors` | Array | Available color metadata for the item when available. |
+| `pbk` | String | Product base class marker when available. |
+| `sale_tags` | Array | Sales or campaign tags attached to the variation when available. |
+| `social_proof` | Object | Social proof metadata when provided by source data. |
+| `sustainability_badges` | Array | Sustainability labels for the variation when available. |
+| `click_tracking` | Object | Tracking attributes tied to item click analytics. |
+| `feature_tracking` | Object | Tracking attributes tied to ranking and feature analytics. |
 
 ---
 
@@ -115,18 +133,26 @@ Collect a larger dataset for analysis:
 {
     "name": "Tommy Hilfiger Big & Tall T-Shirt BT-BRAND LOVE BIG HILFIGER Rundhals, normale Passform, Große Größen",
     "brand": "Tommy Hilfiger Big & Tall",
-    "price": "28.99",
-    "original_price": "39.90",
+    "price": 28.99,
+    "original_price": 39.9,
     "rating": 5,
     "review_count": 4,
     "availability": "lieferbar - in 1-2 Werktagen bei dir",
     "image_url": "https://i.otto.de/i/otto/470ac366-4969-5bae-9ee4-0a7124ccd145?$responsive_ft2$",
     "product_url": "https://www.otto.de/p/tommy-hilfiger-big-tall-t-shirt-bt-brand-love-big-hilfiger-rundhals-normale-passform-grosse-groessen-1975656957/",
     "url": "https://www.otto.de/p/tommy-hilfiger-big-tall-t-shirt-bt-brand-love-big-hilfiger-rundhals-normale-passform-grosse-groessen-1975656957/",
+    "product_id": "1975656957",
+    "product_type": "organic",
     "article_number": "59868001",
     "variation_id": "1975656958",
+    "local_list_position": 14,
+    "actual_list_position": 14,
+    "origin_position": 14,
+    "list_type": "AS",
+    "page_no": 1,
+    "page_offset": 0,
     "data_quality": "rich",
-    "source": "listing"
+    "source": "dundee_tilelist_api"
 }
 ```
 
@@ -192,7 +218,7 @@ Yes. Provide a category or filtered listing URL in `startUrl`.
 Some products may not expose every attribute at runtime. The actor still returns available fields in a consistent structure.
 
 ### Is duplicate data prevented?
-Yes. The actor includes deduplication safeguards so repeated product links are not pushed multiple times in one run.
+Yes. The actor deduplicates products across pages and emits only unique records in a run.
 
 ### Should I use proxies?
 For small tests, direct requests may work. For large or scheduled runs, proxies are recommended for higher stability.
