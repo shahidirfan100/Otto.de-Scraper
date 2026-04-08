@@ -32,7 +32,8 @@
       "type": "integer",
       "description": "The maximum number of products to collect. Leave empty to collect all available products.",
       "minimum": 1,
-      "default": 100,
+      "default": 20,
+      "prefill": 20,
       "editor": "number"
     },
     "max_pages": {

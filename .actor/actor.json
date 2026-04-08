@@ -3,7 +3,7 @@
   "name": "otto-de-scraper",
   "version": "1.0",
   "meta": {
-    "generatedBy": "GPT-5.3-Codex"
+    "generatedBy": "GPT-5 Codex"
   },
   "buildTag": "latest",
   "dockerfile": "../Dockerfile",

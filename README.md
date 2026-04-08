@@ -38,7 +38,7 @@ Feed data into no-code or API workflows for downstream processing. Automate repo
 | `startUrl` | String | No | `""` | Otto.de start page URL. If provided, this is used first. |
 | `searchQuery` | String | No | `"shirt"` | Search term used when `startUrl` is empty. |
 | `collectDetails` | Boolean | No | `true` | Prioritizes richer product records with complete fields when available. |
-| `results_wanted` | Integer | No | `100` | Maximum number of products to collect. |
+| `results_wanted` | Integer | No | `20` | Maximum number of products to collect. |
 | `max_pages` | Integer | No | `20` | Maximum number of listing pages to process. |
 | `proxyConfiguration` | Object | No | `{"useApifyProxy": false, "apifyProxyGroups": ["RESIDENTIAL"]}` | Proxy settings for reliability and anti-blocking support. |
 

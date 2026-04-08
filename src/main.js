@@ -9,6 +9,10 @@ const OFFSET_STEP = 24;
 const PUSH_BATCH_SIZE = 25;
 const PROGRESS_LOG_STEP = 25;
 const REQUEST_TIMEOUT_MS = 35000;
+const MAX_HTTP_RETRIES = 3;
+const MAX_ROUTE_REFRESHES = 2;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
 
 const asCleanString = (value) => {
     if (value === null || value === undefined) return null;
@@ -151,21 +155,99 @@ const deepCleanValue = (value) => {
     return value;
 };
 
-const extractDundeeData = (html) => {
-    const marker = '<script type="application/encoded+json; encoding=url;" data-kestrel-app="reptile.dundee">';
-    const start = html.indexOf(marker);
-    if (start < 0) return null;
+const wait = async (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    const from = start + marker.length;
-    const end = html.indexOf('</script>', from);
-    if (end < 0) return null;
+const getRetryDelayMs = (attempt) => {
+    const base = RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1));
+    const jitter = Math.floor(Math.random() * 200);
+    return Math.min(base + jitter, 5000);
+};
 
-    try {
-        const decoded = decodeURIComponent(html.slice(from, end));
-        return JSON.parse(decoded);
-    } catch {
-        return null;
+const isRetryableStatusCode = (statusCode) => RETRYABLE_STATUS_CODES.has(statusCode);
+
+const decodeEscapedRoutePath = (value) => {
+    const raw = asCleanString(value);
+    if (!raw) return null;
+
+    return raw
+        .replace(/\\u0026/g, '&')
+        .replace(/\\u003d/g, '=')
+        .replace(/\\\//g, '/');
+};
+
+const extractRoutePathFromText = (text) => {
+    if (!text) return null;
+
+    const patterns = [
+        /["']((?:\\\/|\/)dundee(?:\\\/|\/)tilelist[^"']*)["']/i,
+        /((?:\\\/|\/)dundee(?:\\\/|\/)tilelist\?[^\s<>"']+)/i,
+        /((?:\\\/|\/)dundee(?:\\\/|\/)tilelist(?:[^\s<>"']*))/i,
+    ];
+
+    for (const pattern of patterns) {
+        const match = pattern.exec(text);
+        if (!match?.[1]) continue;
+
+        const decoded = decodeEscapedRoutePath(match[1]);
+        if (decoded && decoded.includes('/dundee/tilelist')) return decoded;
     }
+
+    return null;
+};
+
+const extractDundeeBootstrap = (html) => {
+    const scriptPattern = /<script[^>]*data-kestrel-app=["']reptile\.dundee["'][^>]*>([\s\S]*?)<\/script>/gi;
+    let routePath = null;
+    let initialPayload = null;
+    let source = null;
+
+    let match = null;
+    while ((match = scriptPattern.exec(html)) !== null) {
+        const content = typeof match[1] === 'string' ? match[1].trim() : null;
+        if (!content) continue;
+
+        if (!routePath) {
+            routePath = extractRoutePathFromText(content);
+            if (routePath) source = 'script_regex';
+        }
+
+        let parsed = null;
+        try {
+            parsed = JSON.parse(content);
+        } catch {
+            try {
+                parsed = JSON.parse(decodeURIComponent(content));
+            } catch {
+                parsed = null;
+            }
+        }
+
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+
+        if (!routePath) {
+            const parsedRoutePath = decodeEscapedRoutePath(parsed.routePath);
+            if (parsedRoutePath && parsedRoutePath.includes('/dundee/tilelist')) {
+                routePath = parsedRoutePath;
+                source = source || 'script_json';
+            }
+        }
+
+        if (!initialPayload && parsed?.data?.payload && typeof parsed.data.payload === 'object') {
+            initialPayload = parsed.data.payload;
+            source = source || 'script_json';
+        }
+    }
+
+    if (!routePath) {
+        routePath = extractRoutePathFromText(html);
+        if (routePath) source = source || 'page_regex';
+    }
+
+    return {
+        routePath: decodeEscapedRoutePath(routePath),
+        initialPayload,
+        source,
+    };
 };
 
 const pickVariation = (tile) => {
@@ -410,28 +492,183 @@ try {
         };
     };
 
-    const initialRequest = await getRequestContext({ refererUrl: normalizedStartUrl, isApiRequest: false });
-    const initialResponse = await gotScraping.get(normalizedStartUrl, {
-        headers: initialRequest.headers,
-        proxyUrl: initialRequest.proxyUrl,
-        timeout: { request: REQUEST_TIMEOUT_MS },
-        throwHttpErrors: false,
+    const fetchWithRetries = async ({ url, refererUrl, isApiRequest, expectJson, label }) => {
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= MAX_HTTP_RETRIES; attempt++) {
+            const requestContext = await getRequestContext({ refererUrl, isApiRequest });
+
+            try {
+                const response = await gotScraping.get(url, {
+                    headers: requestContext.headers,
+                    proxyUrl: requestContext.proxyUrl,
+                    timeout: { request: REQUEST_TIMEOUT_MS },
+                    throwHttpErrors: false,
+                });
+
+                if (response.statusCode >= 400) {
+                    const message = `${label} returned HTTP ${response.statusCode}`;
+                    if (attempt < MAX_HTTP_RETRIES && isRetryableStatusCode(response.statusCode)) {
+                        const delayMs = getRetryDelayMs(attempt);
+                        log.warning(`${message}. Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
+                        await wait(delayMs);
+                        continue;
+                    }
+
+                    const statusError = new Error(message);
+                    statusError.statusCode = response.statusCode;
+                    throw statusError;
+                }
+
+                if (!expectJson) {
+                    return { response };
+                }
+
+                try {
+                    return { response, parsed: JSON.parse(response.body) };
+                } catch {
+                    if (attempt < MAX_HTTP_RETRIES) {
+                        const delayMs = getRetryDelayMs(attempt);
+                        log.warning(`${label} returned invalid JSON. Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
+                        await wait(delayMs);
+                        continue;
+                    }
+
+                    throw new Error(`${label} returned invalid JSON after ${MAX_HTTP_RETRIES} attempts.`);
+                }
+            } catch (error) {
+                lastError = error;
+                const statusCode = asInteger(error?.statusCode);
+                const shouldRetry = !statusCode || isRetryableStatusCode(statusCode);
+
+                if (attempt < MAX_HTTP_RETRIES && shouldRetry) {
+                    const delayMs = getRetryDelayMs(attempt);
+                    log.warning(`${label} request failed (${error.message}). Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
+                    await wait(delayMs);
+                    continue;
+                }
+
+                throw error;
+            }
+        }
+
+        throw lastError || new Error(`${label} failed after ${MAX_HTTP_RETRIES} attempts.`);
+    };
+
+    const startPageResult = await fetchWithRetries({
+        url: normalizedStartUrl,
+        refererUrl: normalizedStartUrl,
+        isApiRequest: false,
+        expectJson: false,
+        label: 'Start page',
     });
 
-    if (initialResponse.statusCode >= 400) {
-        throw new Error(`Failed loading start page (${initialResponse.statusCode}).`);
+    const startPageUrl = new URL(normalizedStartUrl);
+    const bootstrap = extractDundeeBootstrap(startPageResult.response.body);
+    let routePath = asCleanString(bootstrap.routePath);
+    let initialPayload = bootstrap.initialPayload && typeof bootstrap.initialPayload === 'object'
+        ? bootstrap.initialPayload
+        : null;
+
+    if (!routePath) {
+        throw new Error('Could not locate Dundee tilelist route on start page.');
     }
 
-    const dundeeData = extractDundeeData(initialResponse.body);
-    const routePath = asCleanString(dundeeData?.routePath);
-    const initialPayload = dundeeData?.data?.payload;
+    log.info(`Resolved Dundee tilelist route via ${bootstrap.source || 'unknown'} bootstrap strategy.`);
 
-    if (!routePath || !initialPayload) {
-        throw new Error('Could not locate Dundee tilelist payload on start page.');
-    }
+    let layout = asCleanString(initialPayload?.page?.l) || asCleanString(startPageUrl.searchParams.get('l'));
+    let currentOffset = asInteger(initialPayload?.page?.o) ?? asInteger(startPageUrl.searchParams.get('o')) ?? 0;
+    let initialPayloadOffset = asInteger(initialPayload?.page?.o);
+    let routeRefreshCount = 0;
 
-    const layout = asCleanString(initialPayload?.page?.l);
-    let currentOffset = asInteger(initialPayload?.page?.o) ?? 0;
+    const refreshRouteFromStartPage = async (reason) => {
+        if (routeRefreshCount >= MAX_ROUTE_REFRESHES) return false;
+        routeRefreshCount += 1;
+
+        log.warning(`Refreshing Dundee route after ${reason} (attempt ${routeRefreshCount}/${MAX_ROUTE_REFRESHES}).`);
+
+        try {
+            const refreshedStart = await fetchWithRetries({
+                url: normalizedStartUrl,
+                refererUrl: normalizedStartUrl,
+                isApiRequest: false,
+                expectJson: false,
+                label: 'Start page refresh',
+            });
+
+            const refreshedBootstrap = extractDundeeBootstrap(refreshedStart.response.body);
+            const refreshedRoutePath = asCleanString(refreshedBootstrap.routePath);
+
+            if (!refreshedRoutePath) {
+                log.warning('Route refresh did not find a Dundee route path.');
+                return false;
+            }
+
+            routePath = refreshedRoutePath;
+            if (!initialPayload && refreshedBootstrap.initialPayload && typeof refreshedBootstrap.initialPayload === 'object') {
+                initialPayload = refreshedBootstrap.initialPayload;
+                initialPayloadOffset = asInteger(initialPayload?.page?.o);
+                layout = asCleanString(initialPayload?.page?.l) || layout;
+            }
+
+            log.info(`Recovered Dundee route via ${refreshedBootstrap.source || 'unknown'} strategy.`);
+            return true;
+        } catch (refreshError) {
+            log.warning(`Route refresh failed: ${refreshError.message}`);
+            return false;
+        }
+    };
+
+    const loadPayloadForOffset = async ({ offset, page }) => {
+        if (page === 1 && initialPayload && (initialPayloadOffset === null || offset === initialPayloadOffset)) {
+            return { payload: initialPayload, apiUrl: buildTilelistApiUrl({ routePath, offset, layout }) };
+        }
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const apiUrl = buildTilelistApiUrl({ routePath, offset, layout });
+
+            try {
+                const { parsed } = await fetchWithRetries({
+                    url: apiUrl,
+                    refererUrl: normalizedStartUrl,
+                    isApiRequest: true,
+                    expectJson: true,
+                    label: `Tilelist offset=${offset}`,
+                });
+
+                const payload = parsed?.data?.payload;
+                if (payload && typeof payload === 'object') {
+                    return { payload, apiUrl };
+                }
+
+                const responseRoutePath = asCleanString(parsed?.routePath);
+                if (responseRoutePath && responseRoutePath.includes('/dundee/tilelist') && responseRoutePath !== routePath) {
+                    routePath = responseRoutePath;
+                    log.warning(`API returned updated Dundee route, retrying offset=${offset}.`);
+                    continue;
+                }
+
+                if (attempt === 1) {
+                    const recovered = await refreshRouteFromStartPage(`missing payload at offset=${offset}`);
+                    if (recovered) continue;
+                }
+
+                log.warning(`Tilelist payload missing at offset=${offset}.`);
+                return { payload: null, apiUrl };
+            } catch (error) {
+                if (attempt === 1) {
+                    const recovered = await refreshRouteFromStartPage(`request failure at offset=${offset}: ${error.message}`);
+                    if (recovered) continue;
+                }
+
+                log.warning(`Stopping after tilelist request failure on offset=${offset}: ${error.message}`);
+                return { payload: null, apiUrl };
+            }
+        }
+
+        return { payload: null, apiUrl: null };
+    };
+
     let pageNo = 1;
     let saved = 0;
     let lastProgressLogged = 0;
@@ -441,36 +678,8 @@ try {
     log.info(`Starting API extraction: results_wanted=${resultsWanted}, max_pages=${maxPages}, collectDetails=${Boolean(collectDetails)}`);
 
     while (saved < resultsWanted && pageNo <= maxPages) {
-        const apiUrl = buildTilelistApiUrl({ routePath, offset: currentOffset, layout });
-
-        let payload = null;
-
-        if (pageNo === 1 && currentOffset === (asInteger(initialPayload?.page?.o) ?? 0)) {
-            payload = initialPayload;
-        } else {
-            const requestContext = await getRequestContext({ refererUrl: apiUrl, isApiRequest: true });
-            const apiResponse = await gotScraping.get(apiUrl, {
-                headers: requestContext.headers,
-                proxyUrl: requestContext.proxyUrl,
-                timeout: { request: REQUEST_TIMEOUT_MS },
-                throwHttpErrors: false,
-            });
-
-            if (apiResponse.statusCode >= 400) {
-                log.warning(`Stopping after API ${apiResponse.statusCode} on offset=${currentOffset}`);
-                break;
-            }
-
-            let parsed = null;
-            try {
-                parsed = JSON.parse(apiResponse.body);
-            } catch {
-                log.warning(`Stopping due to invalid JSON on offset=${currentOffset}`);
-                break;
-            }
-
-            payload = parsed?.data?.payload;
-        }
+        const { payload } = await loadPayloadForOffset({ offset: currentOffset, page: pageNo });
+        if (!payload) break;
 
         const tiles = Array.isArray(payload?.tileListItems) ? payload.tileListItems : [];
         if (tiles.length === 0) {

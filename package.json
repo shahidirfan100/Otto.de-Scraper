@@ -4,7 +4,7 @@
   "description": "Lightweight Otto.de product scraper using Cheerio (Crawlee + gotScraping).",
   "type": "module",
   "dependencies": {
-    "apify": "^3.6.0",
+    "apify": "^3.7.0",
     "crawlee": "^3.16.0",
     "cheerio": "^1.2.0",
     "got-scraping": "^4.2.1"
