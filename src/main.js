@@ -115,6 +115,8 @@ const normalizePrice = (value) => {
     return Number.isFinite(parsed) ? parsed : null;
 };
 
+const hasVariationPayload = (tile) => Array.isArray(tile?.variations) && tile.variations.length > 0;
+
 const buildSearchUrl = (query) => {
     const term = asCleanString(query);
     if (!term) return null;
@@ -672,6 +674,7 @@ try {
     let pageNo = 1;
     let saved = 0;
     let lastProgressLogged = 0;
+    let pagesWithoutNewRecords = 0;
 
     const seenKeys = new Set();
 
@@ -687,9 +690,14 @@ try {
             break;
         }
 
+        const candidateTiles = collectDetails ? tiles.filter(hasVariationPayload) : tiles;
+        if (collectDetails) {
+            log.debug(`Offset ${currentOffset}: ${candidateTiles.length}/${tiles.length} tiles include variation payload.`);
+        }
+
         const records = [];
 
-        for (const tile of tiles) {
+        for (const tile of candidateTiles) {
             if (saved + records.length >= resultsWanted) break;
 
             const record = buildRecordFromTile({
@@ -707,6 +715,17 @@ try {
 
             seenKeys.add(dedupeKey);
             records.push(record);
+        }
+
+        if (records.length === 0) {
+            pagesWithoutNewRecords += 1;
+            log.info(`No new deduplicated records at offset=${currentOffset} (streak ${pagesWithoutNewRecords}).`);
+            if (pagesWithoutNewRecords >= 2) {
+                log.info('Stopping after repeated pages without new records.');
+                break;
+            }
+        } else {
+            pagesWithoutNewRecords = 0;
         }
 
         for (let i = 0; i < records.length; i += PUSH_BATCH_SIZE) {
