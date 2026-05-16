@@ -2,9 +2,6 @@
   "actorSpecification": 1,
   "name": "otto-de-scraper",
   "version": "1.0",
-  "meta": {
-    "generatedBy": "GPT-5 Codex"
-  },
   "buildTag": "latest",
   "dockerfile": "../Dockerfile",
   "readme": "../README.md",

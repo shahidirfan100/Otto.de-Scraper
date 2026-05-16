@@ -1,8 +1,8 @@
-import { Actor } from 'apify';
-import log from '@apify/log';
-import { gotScraping } from 'got-scraping';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+
+import { Actor, log } from 'apify';
+import { gotScraping } from 'got-scraping';
 
 const OTTO_ORIGIN = 'https://www.otto.de';
 const OFFSET_STEP = 24;
@@ -117,6 +117,47 @@ const normalizePrice = (value) => {
 
 const hasVariationPayload = (tile) => Array.isArray(tile?.variations) && tile.variations.length > 0;
 
+const asObject = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : null);
+
+const getPayloadPageContainer = (payload) => {
+    const payloadObject = asObject(payload);
+    if (!payloadObject) return null;
+    return asObject(payloadObject.page) || payloadObject;
+};
+
+const getPayloadPageParams = (payload) => {
+    const pageContainer = getPayloadPageContainer(payload);
+    if (!pageContainer) return null;
+    return asObject(pageContainer.page) || pageContainer;
+};
+
+const getPayloadTileListItems = (payload) => {
+    const payloadObject = asObject(payload);
+    const pageContainer = getPayloadPageContainer(payload);
+
+    const candidates = [
+        pageContainer?.tileListItems,
+        payloadObject?.tileListItems,
+        pageContainer?.items,
+        payloadObject?.items,
+        pageContainer?.products,
+        payloadObject?.products,
+    ];
+
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) return candidate;
+    }
+
+    return [];
+};
+
+const getPayloadPagination = (payload) => {
+    const payloadObject = asObject(payload);
+    const pageContainer = getPayloadPageContainer(payload);
+    const pagination = asObject(pageContainer?.pagination) || asObject(payloadObject?.pagination);
+    return pagination || null;
+};
+
 const buildSearchUrl = (query) => {
     const term = asCleanString(query);
     if (!term) return null;
@@ -157,10 +198,12 @@ const deepCleanValue = (value) => {
     return value;
 };
 
-const wait = async (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const wait = async (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms);
+});
 
 const getRetryDelayMs = (attempt) => {
-    const base = RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1));
+    const base = RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1));
     const jitter = Math.floor(Math.random() * 200);
     return Math.min(base + jitter, 5000);
 };
@@ -292,9 +335,12 @@ const makeDedupeKey = (record) => {
 };
 
 const normalizeColors = (tile, variation) => {
-    const rawColors = Array.isArray(tile?.colors)
-        ? tile.colors
-        : (Array.isArray(variation?.colors) ? variation.colors : []);
+    let rawColors = [];
+    if (Array.isArray(tile?.colors)) {
+        rawColors = tile.colors;
+    } else if (Array.isArray(variation?.colors)) {
+        rawColors = variation.colors;
+    }
 
     if (rawColors.length === 0) return null;
 
@@ -578,9 +624,9 @@ try {
 
     log.info(`Resolved Dundee tilelist route via ${bootstrap.source || 'unknown'} bootstrap strategy.`);
 
-    let layout = asCleanString(initialPayload?.page?.l) || asCleanString(startPageUrl.searchParams.get('l'));
-    let currentOffset = asInteger(initialPayload?.page?.o) ?? asInteger(startPageUrl.searchParams.get('o')) ?? 0;
-    let initialPayloadOffset = asInteger(initialPayload?.page?.o);
+    let layout = asCleanString(getPayloadPageParams(initialPayload)?.l) || asCleanString(startPageUrl.searchParams.get('l'));
+    let currentOffset = asInteger(getPayloadPageParams(initialPayload)?.o) ?? asInteger(startPageUrl.searchParams.get('o')) ?? 0;
+    let initialPayloadOffset = asInteger(getPayloadPageParams(initialPayload)?.o);
     let routeRefreshCount = 0;
 
     const refreshRouteFromStartPage = async (reason) => {
@@ -609,8 +655,8 @@ try {
             routePath = refreshedRoutePath;
             if (!initialPayload && refreshedBootstrap.initialPayload && typeof refreshedBootstrap.initialPayload === 'object') {
                 initialPayload = refreshedBootstrap.initialPayload;
-                initialPayloadOffset = asInteger(initialPayload?.page?.o);
-                layout = asCleanString(initialPayload?.page?.l) || layout;
+                initialPayloadOffset = asInteger(getPayloadPageParams(initialPayload)?.o);
+                layout = asCleanString(getPayloadPageParams(initialPayload)?.l) || layout;
             }
 
             log.info(`Recovered Dundee route via ${refreshedBootstrap.source || 'unknown'} strategy.`);
@@ -623,7 +669,12 @@ try {
 
     const loadPayloadForOffset = async ({ offset, page }) => {
         if (page === 1 && initialPayload && (initialPayloadOffset === null || offset === initialPayloadOffset)) {
-            return { payload: initialPayload, apiUrl: buildTilelistApiUrl({ routePath, offset, layout }) };
+            const bootstrapItems = getPayloadTileListItems(initialPayload);
+            if (bootstrapItems.length > 0) {
+                return { payload: initialPayload, apiUrl: buildTilelistApiUrl({ routePath, offset, layout }) };
+            }
+
+            log.warning('Bootstrap payload had no tile list items. Falling back to live tilelist API request.');
         }
 
         for (let attempt = 1; attempt <= 2; attempt++) {
@@ -640,6 +691,17 @@ try {
 
                 const payload = parsed?.data?.payload;
                 if (payload && typeof payload === 'object') {
+                    const tileListItems = getPayloadTileListItems(payload);
+                    if (tileListItems.length === 0 && offset === 0 && attempt === 1) {
+                        const payloadKeys = Object.keys(payload);
+                        log.warning(
+                            `Tilelist payload at offset=0 returned no items. Keys: ${payloadKeys.join(', ') || '(none)'}. Refreshing route and retrying.`,
+                        );
+
+                        const recovered = await refreshRouteFromStartPage('empty tile list on first page');
+                        if (recovered) continue;
+                    }
+
                     return { payload, apiUrl };
                 }
 
@@ -684,9 +746,13 @@ try {
         const { payload } = await loadPayloadForOffset({ offset: currentOffset, page: pageNo });
         if (!payload) break;
 
-        const tiles = Array.isArray(payload?.tileListItems) ? payload.tileListItems : [];
+        const tiles = getPayloadTileListItems(payload);
         if (tiles.length === 0) {
-            log.info(`No more tilelist items at offset=${currentOffset}.`);
+            const payloadKeys = Object.keys(asObject(payload) || {});
+            const pageContainerKeys = Object.keys(getPayloadPageContainer(payload) || {});
+            log.warning(
+                `No tilelist items at offset=${currentOffset}. payload keys=${payloadKeys.join(', ') || '(none)'}; page keys=${pageContainerKeys.join(', ') || '(none)'}.`,
+            );
             break;
         }
 
@@ -741,7 +807,7 @@ try {
 
         if (saved >= resultsWanted) break;
 
-        const apiCurrentOffset = asInteger(payload?.pagination?.currentOffset);
+        const apiCurrentOffset = asInteger(getPayloadPagination(payload)?.currentOffset);
         const nextOffset = (apiCurrentOffset ?? currentOffset) + OFFSET_STEP;
 
         if (nextOffset <= currentOffset) {
@@ -757,7 +823,6 @@ try {
 } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     log.error(`Run failed: ${message}`);
-    console.error(error);
     throw error;
 } finally {
     await Actor.exit();

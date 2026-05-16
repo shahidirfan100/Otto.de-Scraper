@@ -4,9 +4,9 @@
   "description": "Lightweight Otto.de product scraper using Cheerio (Crawlee + gotScraping).",
   "type": "module",
   "dependencies": {
-    "apify": "^3.7.0",
-    "crawlee": "^3.16.0",
+    "apify": "^3.7.2",
     "cheerio": "^1.2.0",
+    "crawlee": "^3.16.0",
     "got-scraping": "^4.2.1"
   },
   "scripts": {
@@ -18,5 +18,11 @@
     "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1"
   },
   "author": "Shahid Irfan",
-  "license": "ISC"
+  "license": "ISC",
+  "devDependencies": {
+    "@apify/eslint-config": "^2.0.0",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.3"
+  }
 }
