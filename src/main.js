@@ -2,17 +2,21 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { Actor, log } from 'apify';
-import { gotScraping } from 'got-scraping';
+import { Impit } from 'impit';
 
 const OTTO_ORIGIN = 'https://www.otto.de';
 const OFFSET_STEP = 24;
 const PUSH_BATCH_SIZE = 25;
+const CROCOTILE_BATCH_SIZE = 24;
+const MAX_CROCOTILE_REQUESTS_PER_PAGE = 20;
 const PROGRESS_LOG_STEP = 25;
 const REQUEST_TIMEOUT_MS = 35000;
 const MAX_HTTP_RETRIES = 3;
 const MAX_ROUTE_REFRESHES = 2;
 const RETRY_BASE_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 5000;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+const EVERGLADES_INTENTS = ['ranked', 'sponsored', 'similar', 'context', 'layout'];
 
 const asCleanString = (value) => {
     if (value === null || value === undefined) return null;
@@ -56,36 +60,23 @@ const getSchemaDefault = (schema, key) => {
     return undefined;
 };
 
-const resolveStringInput = ({ runtimeValue, schemaValue, inputFileValue }) => {
-    const runtimeClean = asCleanString(runtimeValue);
-    if (runtimeClean) return runtimeClean;
-
-    const schemaClean = asCleanString(schemaValue);
-    if (schemaClean) return schemaClean;
-
-    const inputFileClean = asCleanString(inputFileValue);
-    if (inputFileClean) return inputFileClean;
-
-    return null;
-};
-
 const resolvePositiveIntInput = ({ runtimeValue, schemaValue, inputFileValue }) => {
     const runtimeParsed = parsePositiveInt(runtimeValue, null);
     if (runtimeParsed) return runtimeParsed;
 
-    const schemaParsed = parsePositiveInt(schemaValue, null);
-    if (schemaParsed) return schemaParsed;
-
     const inputFileParsed = parsePositiveInt(inputFileValue, null);
     if (inputFileParsed) return inputFileParsed;
+
+    const schemaParsed = parsePositiveInt(schemaValue, null);
+    if (schemaParsed) return schemaParsed;
 
     return null;
 };
 
 const resolveBooleanInput = ({ runtimeValue, schemaValue, inputFileValue, fallback = true }) => {
     if (typeof runtimeValue === 'boolean') return runtimeValue;
-    if (typeof schemaValue === 'boolean') return schemaValue;
     if (typeof inputFileValue === 'boolean') return inputFileValue;
+    if (typeof schemaValue === 'boolean') return schemaValue;
     return fallback;
 };
 
@@ -151,11 +142,71 @@ const getPayloadTileListItems = (payload) => {
     return [];
 };
 
+const getExpectedEvergladesPayload = (parsed) => {
+    const parsedObject = asObject(parsed);
+    if (!parsedObject) return null;
+
+    const nestedPayload = asObject(parsedObject.data?.payload);
+    if (nestedPayload) return nestedPayload;
+
+    return Array.isArray(parsedObject.intents) ? parsedObject : null;
+};
+
+const getPayloadProducts = (payload) => {
+    const intents = Array.isArray(payload?.intents) ? payload.intents : [];
+    const products = [];
+
+    for (const intentName of ['ranked', 'sponsored', 'similar']) {
+        const intent = intents.find((candidate) => candidate?.intent === intentName);
+        if (Array.isArray(intent?.products)) {
+            products.push(...intent.products.filter((product) => asObject(product)));
+        }
+    }
+
+    return products;
+};
+
+const getCrocotileVariations = (payload) => {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.variations)) return payload.variations;
+    return null;
+};
+
+const buildTilesFromProducts = ({ products, variations, offset }) => {
+    const variationById = new Map(
+        variations
+            .filter((variation) => variation?.variationId !== undefined && variation?.variationId !== null)
+            .map((variation) => [String(variation.variationId), variation]),
+    );
+
+    return products.map((product, index) => {
+        const variationId = product?.bestVariationId;
+        const variation = variationById.get(String(variationId));
+
+        return {
+            product,
+            variations: variation ? [variation] : [],
+            currentVariationId: variation?.variationId || variationId,
+            colors: variation?.colors,
+            type: product?.productType === 'sponsored' ? 'AS' : undefined,
+            localListPosition: index + 1,
+            actualListPosition: offset + index + 1,
+            originPosition: index,
+        };
+    });
+};
+
 const getPayloadPagination = (payload) => {
     const payloadObject = asObject(payload);
     const pageContainer = getPayloadPageContainer(payload);
     const pagination = asObject(pageContainer?.pagination) || asObject(payloadObject?.pagination);
-    return pagination || null;
+    if (pagination) return pagination;
+
+    const rankedIntent = Array.isArray(payloadObject?.intents)
+        ? payloadObject.intents.find((intent) => intent?.intent === 'ranked')
+        : null;
+    const currentOffset = asInteger(rankedIntent?.meta?.offset);
+    return currentOffset === null ? null : { currentOffset };
 };
 
 const buildSearchUrl = (query) => {
@@ -202,10 +253,32 @@ const wait = async (ms) => new Promise((resolve) => {
     setTimeout(resolve, ms);
 });
 
-const getRetryDelayMs = (attempt) => {
+const getErrorMessage = (error) => (error instanceof Error ? error.message : String(error));
+
+const getRetryAfterDelayMs = (headers) => {
+    if (!headers || typeof headers.get !== 'function') return null;
+
+    const retryAfter = asCleanString(headers.get('retry-after'));
+    if (!retryAfter) return null;
+
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(Math.ceil(seconds * 1000), MAX_RETRY_DELAY_MS);
+    }
+
+    const retryAt = Date.parse(retryAfter);
+    if (Number.isNaN(retryAt)) return null;
+
+    return Math.min(Math.max(0, retryAt - Date.now()), MAX_RETRY_DELAY_MS);
+};
+
+const getRetryDelayMs = (attempt, headers) => {
+    const retryAfterDelayMs = getRetryAfterDelayMs(headers);
+    if (retryAfterDelayMs !== null) return retryAfterDelayMs;
+
     const base = RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1));
     const jitter = Math.floor(Math.random() * 200);
-    return Math.min(base + jitter, 5000);
+    return Math.min(base + jitter, MAX_RETRY_DELAY_MS);
 };
 
 const isRetryableStatusCode = (statusCode) => RETRYABLE_STATUS_CODES.has(statusCode);
@@ -303,22 +376,37 @@ const pickVariation = (tile) => {
     return variations.find((variation) => String(variation?.variationId || '') === currentVariationId) || variations[0] || null;
 };
 
-const buildTilelistApiUrl = ({ routePath, offset, layout }) => {
-    const url = new URL(routePath, OTTO_ORIGIN);
+const buildProductsApiUrl = ({ routePath, offset }) => {
+    const routeUrl = new URL(routePath, OTTO_ORIGIN);
+    const rule = asCleanString(routeUrl.searchParams.get('rule'));
+    if (!rule) return null;
 
-    if (layout) {
-        url.searchParams.set('l', layout);
+    const apiUrl = new URL('/everglades/products', OTTO_ORIGIN);
+    apiUrl.searchParams.set('rule', rule);
+
+    const intents = [...EVERGLADES_INTENTS];
+    if (routeUrl.searchParams.get('l')) {
+        intents.splice(intents.indexOf('layout'), 1);
     }
-
     if (offset > 0) {
-        url.searchParams.set('o', String(offset));
-    } else {
-        url.searchParams.delete('o');
+        intents.splice(intents.indexOf('similar'), 1);
+        apiUrl.searchParams.set('ranked.offset', String(offset));
     }
 
-    url.searchParams.delete('c');
+    for (const intent of intents) {
+        apiUrl.searchParams.append('intents', intent);
+    }
 
-    return url.href;
+    const sortOrder = asCleanString(routeUrl.searchParams.get('sortiertnach'));
+    if (sortOrder) apiUrl.searchParams.set('ranked.sortOrder', sortOrder);
+
+    return apiUrl.href;
+};
+
+const buildCrocotileApiUrl = (variationIds) => {
+    const apiUrl = new URL('/crocotile/tile/data', OTTO_ORIGIN);
+    apiUrl.searchParams.set('variationIds', variationIds.join(','));
+    return apiUrl.href;
 };
 
 const makeDedupeKey = (record) => {
@@ -460,20 +548,47 @@ await Actor.init();
 try {
     const input = (await Actor.getInput()) || {};
 
-    const inputFile = await readJsonFileSafe(path.resolve(process.cwd(), 'INPUT.json'));
+    const inputFile = Actor.isAtHome()
+        ? {}
+        : await readJsonFileSafe(path.resolve(process.cwd(), 'INPUT.json'));
     const schema = await readJsonFileSafe(path.resolve(process.cwd(), '.actor', 'input_schema.json'));
 
-    const startUrl = resolveStringInput({
-        runtimeValue: input.startUrl,
-        schemaValue: getSchemaDefault(schema, 'startUrl'),
-        inputFileValue: inputFile.startUrl,
-    });
+    const runtimeStartUrl = asCleanString(input.startUrl);
+    const runtimeSearchQuery = asCleanString(input.searchQuery);
+    const inputFileStartUrl = asCleanString(inputFile.startUrl);
+    const inputFileSearchQuery = asCleanString(inputFile.searchQuery);
+    let startUrl;
+    let searchQuery;
 
-    const searchQuery = resolveStringInput({
-        runtimeValue: input.searchQuery,
-        schemaValue: getSchemaDefault(schema, 'searchQuery'),
-        inputFileValue: inputFile.searchQuery,
-    });
+    if (runtimeStartUrl && runtimeSearchQuery) {
+        throw new Error('Provide either startUrl or searchQuery, not both.');
+    }
+
+    if (runtimeStartUrl) {
+        startUrl = runtimeStartUrl;
+        searchQuery = null;
+    } else if (runtimeSearchQuery) {
+        startUrl = null;
+        searchQuery = runtimeSearchQuery;
+    } else if (inputFileStartUrl && inputFileSearchQuery) {
+        throw new Error('Provide either startUrl or searchQuery in INPUT.json, not both.');
+    } else if (inputFileStartUrl) {
+        startUrl = inputFileStartUrl;
+        searchQuery = null;
+    } else if (inputFileSearchQuery) {
+        startUrl = null;
+        searchQuery = inputFileSearchQuery;
+    } else {
+        const fallbackStartUrl = asCleanString(getSchemaDefault(schema, 'startUrl'));
+        const fallbackSearchQuery = asCleanString(getSchemaDefault(schema, 'searchQuery'));
+
+        if (fallbackStartUrl && fallbackSearchQuery) {
+            throw new Error('Configure only one search mode in the input schema: startUrl or searchQuery.');
+        }
+
+        startUrl = fallbackStartUrl;
+        searchQuery = fallbackSearchQuery;
+    }
 
     const collectDetails = resolveBooleanInput({
         runtimeValue: input.collectDetails,
@@ -514,89 +629,80 @@ try {
         throw new Error(`Invalid startUrl host "${startHost}". Only otto.de URLs are supported.`);
     }
 
-    const proxyConfiguration = input.proxyConfiguration
-        ? await Actor.createProxyConfiguration({ ...input.proxyConfiguration })
-        : undefined;
+    const client = new Impit({
+        browser: 'chrome',
+        ignoreTlsErrors: true,
+    });
 
-    const getRequestContext = async ({ refererUrl, isApiRequest }) => {
-        const headers = {
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-            accept: isApiRequest
-                ? 'application/json,text/plain,*/*'
-                : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'accept-language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-            'cache-control': 'no-cache',
-            pragma: 'no-cache',
-            referer: refererUrl,
-        };
+    const getRequestContext = ({ refererUrl, requestHeaders = {} }) => ({
+        headers: {
+            ...(refererUrl && { referer: refererUrl }),
+            ...requestHeaders,
+        },
+    });
 
-        if (!isApiRequest) {
-            headers['upgrade-insecure-requests'] = '1';
-        }
-
-        return {
-            headers,
-            proxyUrl: proxyConfiguration ? await proxyConfiguration.newUrl() : undefined,
-        };
-    };
-
-    const fetchWithRetries = async ({ url, refererUrl, isApiRequest, expectJson, label }) => {
+    const fetchWithRetries = async ({ url, refererUrl, requestHeaders, expectJson, label }) => {
         let lastError = null;
 
         for (let attempt = 1; attempt <= MAX_HTTP_RETRIES; attempt++) {
-            const requestContext = await getRequestContext({ refererUrl, isApiRequest });
+            const requestContext = getRequestContext({ refererUrl, requestHeaders });
+            const abortController = new AbortController();
+            const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
 
             try {
-                const response = await gotScraping.get(url, {
-                    headers: requestContext.headers,
-                    proxyUrl: requestContext.proxyUrl,
-                    timeout: { request: REQUEST_TIMEOUT_MS },
-                    throwHttpErrors: false,
+                const response = await client.fetch(url, {
+                    ...requestContext,
+                    signal: abortController.signal,
                 });
 
-                if (response.statusCode >= 400) {
-                    const message = `${label} returned HTTP ${response.statusCode}`;
-                    if (attempt < MAX_HTTP_RETRIES && isRetryableStatusCode(response.statusCode)) {
-                        const delayMs = getRetryDelayMs(attempt);
+                if (!response || typeof response.status !== 'number') {
+                    throw new Error(`${label} returned an invalid response.`);
+                }
+
+                if (!response.ok) {
+                    const message = `${label} returned HTTP ${response.status}`;
+                    if (attempt < MAX_HTTP_RETRIES && isRetryableStatusCode(response.status)) {
+                        const delayMs = getRetryDelayMs(attempt, response.headers);
                         log.warning(`${message}. Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
                         await wait(delayMs);
                         continue;
                     }
 
                     const statusError = new Error(message);
-                    statusError.statusCode = response.statusCode;
+                    statusError.statusCode = response.status;
                     throw statusError;
                 }
 
-                if (!expectJson) {
-                    return { response };
+                const body = await response.text();
+                if (!expectJson) return { response, body };
+
+                const contentType = response.headers?.get?.('content-type');
+                if (contentType && !contentType.toLowerCase().includes('json')) {
+                    log.warning(`${label} returned content-type ${contentType}; expected JSON.`);
                 }
 
                 try {
-                    return { response, parsed: JSON.parse(response.body) };
+                    return { response, body, parsed: JSON.parse(body) };
                 } catch {
-                    if (attempt < MAX_HTTP_RETRIES) {
-                        const delayMs = getRetryDelayMs(attempt);
-                        log.warning(`${label} returned invalid JSON. Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
-                        await wait(delayMs);
-                        continue;
-                    }
-
-                    throw new Error(`${label} returned invalid JSON after ${MAX_HTTP_RETRIES} attempts.`);
+                    const parseError = new Error(`${label} returned invalid JSON.`);
+                    parseError.retryable = false;
+                    throw parseError;
                 }
             } catch (error) {
                 lastError = error;
                 const statusCode = asInteger(error?.statusCode);
-                const shouldRetry = !statusCode || isRetryableStatusCode(statusCode);
+                const shouldRetry = error?.retryable !== false && (!statusCode || isRetryableStatusCode(statusCode));
 
                 if (attempt < MAX_HTTP_RETRIES && shouldRetry) {
                     const delayMs = getRetryDelayMs(attempt);
-                    log.warning(`${label} request failed (${error.message}). Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
+                    log.warning(`${label} request failed (${getErrorMessage(error)}). Retrying in ${delayMs}ms (${attempt}/${MAX_HTTP_RETRIES}).`);
                     await wait(delayMs);
                     continue;
                 }
 
                 throw error;
+            } finally {
+                clearTimeout(timeoutId);
             }
         }
 
@@ -606,13 +712,12 @@ try {
     const startPageResult = await fetchWithRetries({
         url: normalizedStartUrl,
         refererUrl: normalizedStartUrl,
-        isApiRequest: false,
         expectJson: false,
         label: 'Start page',
     });
 
     const startPageUrl = new URL(normalizedStartUrl);
-    const bootstrap = extractDundeeBootstrap(startPageResult.response.body);
+    const bootstrap = extractDundeeBootstrap(startPageResult.body);
     let routePath = asCleanString(bootstrap.routePath);
     let initialPayload = bootstrap.initialPayload && typeof bootstrap.initialPayload === 'object'
         ? bootstrap.initialPayload
@@ -624,7 +729,6 @@ try {
 
     log.info(`Resolved Dundee tilelist route via ${bootstrap.source || 'unknown'} bootstrap strategy.`);
 
-    let layout = asCleanString(getPayloadPageParams(initialPayload)?.l) || asCleanString(startPageUrl.searchParams.get('l'));
     let currentOffset = asInteger(getPayloadPageParams(initialPayload)?.o) ?? asInteger(startPageUrl.searchParams.get('o')) ?? 0;
     let initialPayloadOffset = asInteger(getPayloadPageParams(initialPayload)?.o);
     let routeRefreshCount = 0;
@@ -639,12 +743,11 @@ try {
             const refreshedStart = await fetchWithRetries({
                 url: normalizedStartUrl,
                 refererUrl: normalizedStartUrl,
-                isApiRequest: false,
                 expectJson: false,
                 label: 'Start page refresh',
             });
 
-            const refreshedBootstrap = extractDundeeBootstrap(refreshedStart.response.body);
+            const refreshedBootstrap = extractDundeeBootstrap(refreshedStart.body);
             const refreshedRoutePath = asCleanString(refreshedBootstrap.routePath);
 
             if (!refreshedRoutePath) {
@@ -656,13 +759,12 @@ try {
             if (!initialPayload && refreshedBootstrap.initialPayload && typeof refreshedBootstrap.initialPayload === 'object') {
                 initialPayload = refreshedBootstrap.initialPayload;
                 initialPayloadOffset = asInteger(getPayloadPageParams(initialPayload)?.o);
-                layout = asCleanString(getPayloadPageParams(initialPayload)?.l) || layout;
             }
 
             log.info(`Recovered Dundee route via ${refreshedBootstrap.source || 'unknown'} strategy.`);
             return true;
         } catch (refreshError) {
-            log.warning(`Route refresh failed: ${refreshError.message}`);
+            log.warning(`Route refresh failed: ${getErrorMessage(refreshError)}`);
             return false;
         }
     };
@@ -671,61 +773,141 @@ try {
         if (page === 1 && initialPayload && (initialPayloadOffset === null || offset === initialPayloadOffset)) {
             const bootstrapItems = getPayloadTileListItems(initialPayload);
             if (bootstrapItems.length > 0) {
-                return { payload: initialPayload, apiUrl: buildTilelistApiUrl({ routePath, offset, layout }) };
+                return { payload: initialPayload, apiUrl: buildProductsApiUrl({ routePath, offset }) };
             }
 
-            log.warning('Bootstrap payload had no tile list items. Falling back to live tilelist API request.');
+            log.warning('Bootstrap payload had no tile list items. Falling back to live Everglades API request.');
         }
 
         for (let attempt = 1; attempt <= 2; attempt++) {
-            const apiUrl = buildTilelistApiUrl({ routePath, offset, layout });
+            const apiUrl = buildProductsApiUrl({ routePath, offset });
+            if (!apiUrl) {
+                log.warning(`Could not build Everglades API URL for offset=${offset}: route has no rule.`);
+                return { payload: null, apiUrl: null };
+            }
 
             try {
                 const { parsed } = await fetchWithRetries({
                     url: apiUrl,
                     refererUrl: normalizedStartUrl,
-                    isApiRequest: true,
                     expectJson: true,
-                    label: `Tilelist offset=${offset}`,
+                    label: `Everglades offset=${offset}`,
                 });
 
-                const payload = parsed?.data?.payload;
-                if (payload && typeof payload === 'object') {
-                    const tileListItems = getPayloadTileListItems(payload);
+                const payload = getExpectedEvergladesPayload(parsed);
+                if (payload) {
+                    if (!Array.isArray(payload.intents)) {
+                        const payloadKeys = Object.keys(payload);
+                        log.warning(
+                            `Everglades payload is missing an intents array. Keys: ${payloadKeys.join(', ') || '(none)'}.`,
+                        );
+                    }
+                    let tileListItems = getPayloadTileListItems(payload);
+
+                    if (Array.isArray(payload.intents)) {
+                        const products = getPayloadProducts(payload);
+                        const variations = [];
+
+                        if (collectDetails) {
+                            const variationIds = [...new Set(
+                                products
+                                    .map((product) => asCleanString(product?.bestVariationId))
+                                    .filter(Boolean),
+                            )];
+
+                            if (variationIds.length > 0) {
+                                const variationBatches = [];
+                                for (let batchStart = 0; batchStart < variationIds.length; batchStart += CROCOTILE_BATCH_SIZE) {
+                                    variationBatches.push(variationIds.slice(batchStart, batchStart + CROCOTILE_BATCH_SIZE));
+                                }
+
+                                let variationRequestCount = 0;
+                                const loadVariationBatch = async (batch, batchLabel) => {
+                                    if (batch.length === 0 || variationRequestCount >= MAX_CROCOTILE_REQUESTS_PER_PAGE) return;
+                                    variationRequestCount += 1;
+
+                                    try {
+                                        const variationUrl = buildCrocotileApiUrl(batch);
+                                        const variationResult = await fetchWithRetries({
+                                            url: variationUrl,
+                                            refererUrl: normalizedStartUrl,
+                                            requestHeaders: {
+                                                'crocotile-version': '2',
+                                                'otto-feature': 'tilelist@RepTile-Dundee',
+                                            },
+                                            expectJson: true,
+                                            label: `Crocotile variations offset=${offset} batch=${batchLabel}`,
+                                        });
+                                        const batchVariations = getCrocotileVariations(variationResult.parsed);
+                                        if (batchVariations) {
+                                            variations.push(...batchVariations);
+                                            return;
+                                        }
+
+                                        const variationKeys = Object.keys(asObject(variationResult.parsed) || {});
+                                        log.warning(
+                                            `Crocotile response is missing a variations array for offset=${offset} batch=${batchLabel}. Keys: ${variationKeys.join(', ') || '(none)'}. Using basic records for that batch.`,
+                                        );
+                                    } catch (error) {
+                                        const statusCode = asInteger(error?.statusCode);
+                                        if (statusCode === 400 && batch.length > 1 && variationRequestCount < MAX_CROCOTILE_REQUESTS_PER_PAGE) {
+                                            const midpoint = Math.ceil(batch.length / 2);
+                                            log.warning(
+                                                `Crocotile rejected offset=${offset} batch=${batchLabel} with HTTP 400. Retrying in smaller batches.`,
+                                            );
+                                            await loadVariationBatch(batch.slice(0, midpoint), `${batchLabel}.1`);
+                                            await loadVariationBatch(batch.slice(midpoint), `${batchLabel}.2`);
+                                            return;
+                                        }
+
+                                        log.warning(
+                                            `Crocotile enrichment failed at offset=${offset} batch=${batchLabel}: ${getErrorMessage(error)} Using basic records for that batch.`,
+                                        );
+                                    }
+                                };
+
+                                for (let batchIndex = 0; batchIndex < variationBatches.length; batchIndex += 1) {
+                                    await loadVariationBatch(variationBatches[batchIndex], `${batchIndex + 1}/${variationBatches.length}`);
+                                }
+                            }
+                        }
+
+                        tileListItems = buildTilesFromProducts({ products, variations, offset });
+                    }
+
                     if (tileListItems.length === 0 && offset === 0 && attempt === 1) {
                         const payloadKeys = Object.keys(payload);
                         log.warning(
-                            `Tilelist payload at offset=0 returned no items. Keys: ${payloadKeys.join(', ') || '(none)'}. Refreshing route and retrying.`,
+                            `Everglades payload at offset=0 returned no products. Keys: ${payloadKeys.join(', ') || '(none)'}. Refreshing route and retrying.`,
                         );
 
-                        const recovered = await refreshRouteFromStartPage('empty tile list on first page');
+                        const recovered = await refreshRouteFromStartPage('empty product list on first page');
                         if (recovered) continue;
                     }
 
-                    return { payload, apiUrl };
+                    return { payload: { ...payload, tileListItems }, apiUrl };
                 }
 
-                const responseRoutePath = asCleanString(parsed?.routePath);
-                if (responseRoutePath && responseRoutePath.includes('/dundee/tilelist') && responseRoutePath !== routePath) {
-                    routePath = responseRoutePath;
-                    log.warning(`API returned updated Dundee route, retrying offset=${offset}.`);
-                    continue;
-                }
+                const responseKeys = Object.keys(asObject(parsed) || {});
+                const responseType = Array.isArray(parsed) ? 'array' : typeof parsed;
+                log.warning(
+                    `Everglades response missing expected data.payload/intents at offset=${offset}. Type=${responseType}; keys=${responseKeys.join(', ') || '(none)'}.`,
+                );
 
                 if (attempt === 1) {
                     const recovered = await refreshRouteFromStartPage(`missing payload at offset=${offset}`);
                     if (recovered) continue;
                 }
 
-                log.warning(`Tilelist payload missing at offset=${offset}.`);
+                log.warning(`Everglades payload missing at offset=${offset}.`);
                 return { payload: null, apiUrl };
             } catch (error) {
                 if (attempt === 1) {
-                    const recovered = await refreshRouteFromStartPage(`request failure at offset=${offset}: ${error.message}`);
+                    const recovered = await refreshRouteFromStartPage(`request failure at offset=${offset}: ${getErrorMessage(error)}`);
                     if (recovered) continue;
                 }
 
-                log.warning(`Stopping after tilelist request failure on offset=${offset}: ${error.message}`);
+                log.warning(`Stopping after Everglades request failure on offset=${offset}: ${getErrorMessage(error)}`);
                 return { payload: null, apiUrl };
             }
         }
@@ -756,9 +938,14 @@ try {
             break;
         }
 
-        const candidateTiles = collectDetails ? tiles.filter(hasVariationPayload) : tiles;
+        const richTiles = tiles.filter(hasVariationPayload);
+        const candidateTiles = collectDetails && richTiles.length > 0 ? richTiles : tiles;
         if (collectDetails) {
-            log.debug(`Offset ${currentOffset}: ${candidateTiles.length}/${tiles.length} tiles include variation payload.`);
+            if (richTiles.length === 0) {
+                log.warning(`No variation payloads at offset=${currentOffset}; using basic product records.`);
+            } else {
+                log.debug(`Offset ${currentOffset}: ${richTiles.length}/${tiles.length} tiles include variation payload.`);
+            }
         }
 
         const records = [];
@@ -821,7 +1008,7 @@ try {
 
     log.info(`Finished. Saved ${saved} deduplicated items.`);
 } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = getErrorMessage(error);
     log.error(`Run failed: ${message}`);
     throw error;
 } finally {

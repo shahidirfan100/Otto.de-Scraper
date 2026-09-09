@@ -1,6 +1,6 @@
 {
   "title": "Otto.de Product Scraper",
-  "description": "Scrape products from Otto.de using JSON-first extraction from search/category pages. The actor paginates by offset, de-duplicates items, and falls back to HTML extraction when needed.",
+  "description": "Scrape products from Otto.de using JSON-first extraction from search/category pages. Provide either a start URL or a search query; when neither is supplied, the configured start URL fallback is used.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
@@ -17,8 +17,7 @@
       "type": "string",
       "description": "Search term used when Start URL is empty.",
       "editor": "textfield",
-      "default": "shirt",
-      "prefill": "shirt"
+      "default": ""
     },
     "collectDetails": {
       "title": "Prefer rich records",
@@ -43,15 +42,6 @@
       "minimum": 1,
       "editor": "number",
       "default": 20
-    },
-    "proxyConfiguration": {
-      "title": "Proxy configuration",
-      "type": "object",
-      "description": "Use Apify Proxy for better results.",
-      "editor": "proxy",
-      "default": {
-        "useApifyProxy": false
-      }
     }
   },
   "required": [],

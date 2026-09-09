@@ -6,8 +6,8 @@
   "dependencies": {
     "apify": "^3.7.2",
     "cheerio": "^1.2.0",
-    "crawlee": "^3.16.0",
-    "got-scraping": "^4.2.1"
+    "crawlee": "^3.18.1",
+    "impit": "^0.14.5"
   },
   "scripts": {
     "start": "node src/main.js",

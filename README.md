@@ -64,13 +64,12 @@ Each dataset item represents one unique product listing found on the supplied se
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `startUrl` | String | No | `""` | Public Otto.de search or category URL. When provided, it is used as the starting page. |
-| `searchQuery` | String | No | `"shirt"` | Search term used to build an Otto.de search URL when `startUrl` is empty. |
+| `searchQuery` | String | No | `""` | Search term used to build an Otto.de search URL when `startUrl` is empty. |
 | `collectDetails` | Boolean | No | `true` | Prefer records with richer product variation, price, rating, availability, and catalog information. |
 | `results_wanted` | Integer | No | `20` | Maximum number of unique products to save. Minimum value is `1`. |
 | `max_pages` | Integer | No | `20` | Maximum number of paginated listing pages to process. Minimum value is `1`. |
-| `proxyConfiguration` | Object | No | `{ "useApifyProxy": false }` | Optional Apify Proxy settings for connection routing during larger or recurring runs. |
 
-Provide either `startUrl` or `searchQuery`. If both are empty, the Actor uses the prefilled search query from the input schema. The Actor accepts only Otto.de URLs in `startUrl`.
+Provide either `startUrl` or `searchQuery`, not both. If neither is supplied, the Actor uses the configured start URL fallback from the input schema or `INPUT.json`. The Actor accepts only Otto.de URLs in `startUrl`.
 
 ## Usage Examples
 
@@ -100,18 +99,14 @@ Reuse an Otto.de search or category URL when you need the website's existing fil
 
 ### Larger Collection With Rich Records
 
-Collect a broader product dataset and route the run through Apify Proxy:
+Collect a broader product dataset:
 
 ```json
 {
   "searchQuery": "herren t-shirt",
   "collectDetails": true,
   "results_wanted": 500,
-  "max_pages": 25,
-  "proxyConfiguration": {
-    "useApifyProxy": true,
-    "apifyProxyGroups": ["RESIDENTIAL"]
-  }
+  "max_pages": 25
 }
 ```
 
@@ -153,7 +148,7 @@ This example shows one representative dataset item. Optional product, campaign, 
 - Increase `max_pages` for larger collections, but keep it aligned with the number of products you actually need.
 - Compare `price`, `original_price`, `availability`, and `product_url` across scheduled datasets for price and catalog monitoring.
 - Check several records before assuming a field is unavailable. Otto.de does not publish every attribute for every listing.
-- Use Apify Proxy for larger or recurring collections when the source becomes less consistent without connection routing.
+
 - Report persistent field or availability issues through the Actor's Issues tab because public pages can change.
 
 ## Integrations and Export Formats
